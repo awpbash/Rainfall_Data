@@ -1,0 +1,106 @@
+import pandas as pd
+import requests
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+import os
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Function to convert timestamp to date and time
+def split_timestamp(timestamp):
+    date, time_with_offset = timestamp.split('T')
+    time = time_with_offset.split('+')[0]  # Removing the timezone offset
+    return date, time
+
+# Function to fetch rainfall data for a specific date
+def fetch_rainfall_data(date):
+    url = "https://api.data.gov.sg/v1/environment/rainfall"
+    params = {'date': date}
+    response = requests.get(url, params=params)
+    if response.status_code == 200:
+        return response.json(), date
+    else:
+        print(f"Failed to fetch data for {date}, status code: {response.status_code}")
+        return None, date
+
+# Function to process data and save to Excel with conditional formatting
+def process_and_save_data(result):
+    data, date = result
+    if data is None:
+        print(f"No data to process for {date}")
+        return
+
+    stations = {station['id']: station for station in data['metadata']['stations']}
+    rain_data = {}
+
+    for item in data['items']:
+        timestamp = item['timestamp']
+        date, time = split_timestamp(timestamp)
+        key = (date, time)
+        
+        if key not in rain_data:
+            rain_data[key] = {}
+            
+        readings = item['readings']
+        for reading in readings:
+            station_id = reading['station_id']
+            if station_id in stations:
+                station_info = stations[station_id]
+                rain_data[key][station_info['name']] = reading['value']
+            else:
+                print(f"Station ID {station_id} not found in metadata")
+
+    # Create a DataFrame
+    df = pd.DataFrame(rain_data).T  # Transpose to get dates and times as rows
+    df.index = pd.MultiIndex.from_tuples(df.index, names=['Date', 'Time'])
+
+    # Reorder columns to have station names in the correct order
+    station_names = [stations[station_id]['name'] for station_id in stations]
+    df = df.reindex(columns=station_names)
+
+    # Reset index to have Date and Time as columns
+    df = df.reset_index()
+
+    # Create folder if it doesn't exist
+    folder_name = 'rain_api_data'
+    if not os.path.exists(folder_name):
+        os.makedirs(folder_name)
+
+    # Save to Excel
+    excel_filename = os.path.join(folder_name, f'{date}.xlsx')
+    df.to_excel(excel_filename, index=False)
+
+    # Load the workbook and the sheet
+    wb = load_workbook(excel_filename)
+    ws = wb.active
+
+    # Define the fill for non-zero values
+    highlight_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+    # Apply conditional formatting
+    for row in ws.iter_rows(min_row=2, min_col=3, max_row=ws.max_row, max_col=ws.max_column):
+        for cell in row:
+            if cell.value != 0 and cell.value is not None:
+                cell.fill = highlight_fill
+
+    # Save the workbook
+    wb.save(excel_filename)
+    print(f"Data for {date} has been saved to '{excel_filename}'")
+
+# Main script to iterate through dates and process data
+start_date = datetime.strptime('2024-05-08', '%Y-%m-%d') #<-----------------change the date here
+end_date = datetime.strptime('2024-05-23', '%Y-%m-%d')  #<-----------------change the date here
+
+dates = [start_date + timedelta(days=x) for x in range((end_date - start_date).days + 1)]
+
+# Using ThreadPoolExecutor to parallelize the fetching and processing of data
+with ThreadPoolExecutor(max_workers=10) as executor:
+    future_to_date = {executor.submit(fetch_rainfall_data, date.strftime('%Y-%m-%d')): date for date in dates}
+    
+    for future in as_completed(future_to_date):
+        try:
+            result = future.result()
+            process_and_save_data(result)
+        except Exception as e:
+            date = future_to_date[future]
+            print(f"Error processing data for {date.strftime('%Y-%m-%d')}: {e}")
